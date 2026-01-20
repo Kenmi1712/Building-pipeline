@@ -10,6 +10,7 @@ import psycopg2
 from psycopg2.extras import RealDictCursor
 import torch
 import torch.nn as nn
+from multiprocessing import Pool, current_process, Manager
 from config import *
 
 # ---------------------------------------------------
@@ -21,9 +22,6 @@ OVERLAP = 64      # Overlap between tiles to avoid edge artifacts
 
 # Sentinel-2 bands to use (1-indexed): Blue, Green, Red, NIR, SCL
 SELECTED_BANDS = [2, 3, 4, 8, 15]  # B2, B3, B4, B8, SCL
-
-# GPU Configuration
-USE_GPUS = [0, 1]  # Use both GPU 0 and GPU 1
 
 # ---------------------------------------------------
 # CNN MODEL
@@ -52,12 +50,7 @@ class ImprovedCNN(nn.Module):
 # PATH TRANSFORMATION
 # ---------------------------------------------------
 def transform_db_path_to_actual_path(db_path):
-    """
-    Transform database path to actual file system path
-    
-    /mnt/ridam/68_data/T0/T0S1/... → /mnt/68_data/PROCESSED_DATA_THEMES/T0/T0S1/...
-    /mnt/ridam/115_data/T0/T0S1/... → /home/sac/115_data/T0/T0S1/...
-    """
+    """Transform database path to actual file system path"""
     db_path_str = str(db_path)
     
     if '/mnt/ridam/68_data/' in db_path_str:
@@ -143,21 +136,17 @@ def save_raster_tif(filename, array, bbox, projection='EPSG:4326'):
             dst.write(array[i], i+1)
 
 def is_cloudy_tile(scl_band, threshold=0.80):
-    """
-    Check if tile exceeds cloud threshold
-    Cloud classes: 8=medium clouds, 9=high clouds, 10=thin cirrus, 11=snow/ice
-    """
+    """Check if tile exceeds cloud threshold"""
     cloud_classes = {8, 9, 10, 11}
     cloud_fraction = np.isin(scl_band, list(cloud_classes)).sum() / scl_band.size
     return cloud_fraction >= threshold
 
 # ---------------------------------------------------
-# TILED PROCESSING FOR LARGE IMAGES WITH MULTI-GPU
+# TILED PROCESSING FOR LARGE IMAGES
 # ---------------------------------------------------
-def process_large_image_tiled(models, src_path, devices, tile_size=1024, overlap=64):
+def process_large_image_tiled(model, src_path, device, tile_size=1024, overlap=64):
     """
     Process large image in tiles to avoid CUDA OOM
-    Alternates between GPU 0 and GPU 1 for different tiles
     Reads only selected bands: [2, 3, 4, 8, 15]
     Returns probability array for entire image
     """
@@ -171,23 +160,11 @@ def process_large_image_tiled(models, src_path, devices, tile_size=1024, overlap
         prob_output = np.zeros((full_height, full_width), dtype=np.float32)
         count_output = np.zeros((full_height, full_width), dtype=np.float32)
         
-        # Calculate number of tiles
-        n_tiles_y = (full_height + tile_size - 1) // tile_size
-        n_tiles_x = (full_width + tile_size - 1) // tile_size
-        total_tiles = n_tiles_y * n_tiles_x
-        
-        print(f"  └─ Processing {n_tiles_y}x{n_tiles_x} = {total_tiles} tiles on GPUs {USE_GPUS}")
-        
         tile_count = 0
         
         # Process each tile
         for i in range(0, full_height, tile_size - overlap):
             for j in range(0, full_width, tile_size - overlap):
-                # Alternate between GPUs for load balancing
-                gpu_idx = tile_count % len(devices)
-                device = devices[gpu_idx]
-                model = models[gpu_idx]
-                
                 tile_count += 1
                 
                 # Calculate window bounds
@@ -201,16 +178,14 @@ def process_large_image_tiled(models, src_path, devices, tile_size=1024, overlap
                 
                 # Read only selected bands [2,3,4,8,15]
                 tile_data = src.read(SELECTED_BANDS, window=window)
-                # tile_data shape: (5, height, width) - bands [B2, B3, B4, B8, SCL]
                 
                 # Check if tile is empty
                 if not np.any(tile_data != 0):
                     continue
                 
-                # Extract first 4 bands for model (B2, B3, B4, B8)
-                # Last band (index 4) is SCL for cloud masking
-                msi_bands = tile_data[:4]  # Shape: (4, height, width)
-                scl_band = tile_data[4]     # Shape: (height, width)
+                # Extract first 4 bands for model and SCL band
+                msi_bands = tile_data[:4]
+                scl_band = tile_data[4]
                 
                 # Skip heavily clouded tiles
                 if is_cloudy_tile(scl_band, 0.8):
@@ -219,7 +194,7 @@ def process_large_image_tiled(models, src_path, devices, tile_size=1024, overlap
                 # Normalize to [0, 1] range
                 tile_normalized = msi_bands.astype(np.float32) / 10000.0
                 
-                # Run inference on selected GPU
+                # Run inference
                 model.eval()
                 with torch.no_grad():
                     tensor = torch.from_numpy(tile_normalized).unsqueeze(0).to(device)
@@ -227,27 +202,33 @@ def process_large_image_tiled(models, src_path, devices, tile_size=1024, overlap
                     
                     # Free GPU memory
                     del tensor
-                    if 'cuda' in str(device):
-                        torch.cuda.empty_cache()
+                    torch.cuda.empty_cache()
                 
-                # Add to output (weighted averaging for overlapping regions)
+                # Add to output
                 prob_output[row_off:row_off+win_height, col_off:col_off+win_width] += prob_tile
                 count_output[row_off:row_off+win_height, col_off:col_off+win_width] += 1
-                
-                if tile_count % 20 == 0:
-                    print(f"      Tile {tile_count}/{total_tiles} processed (GPU {gpu_idx})")
         
         # Average overlapping regions
-        count_output[count_output == 0] = 1  # Avoid division by zero
+        count_output[count_output == 0] = 1
         prob_output = prob_output / count_output
         
         return prob_output, bbox, crs
 
 # ---------------------------------------------------
-# PROCESS SINGLE FILE
+# WORKER FUNCTION FOR MULTIPROCESSING
 # ---------------------------------------------------
-def process_file_record(models, record, processed_set, devices):
-    """Process a single Sentinel-2 file from database record"""
+def process_file_worker(args):
+    """
+    Worker function that processes a single file on assigned GPU
+    Each worker gets a GPU assigned based on worker ID
+    """
+    record, processed_set, num_gpus = args
+    
+    # Get GPU ID for this worker (round-robin assignment)
+    worker_id = int(current_process().name.split('-')[-1]) - 1
+    gpu_id = worker_id % num_gpus
+    device = torch.device(f'cuda:{gpu_id}')
+    
     db_path = record['source_file_path']
     timestamp = record['timestamp']
     data_id = record['data_id']
@@ -255,13 +236,13 @@ def process_file_record(models, record, processed_set, devices):
     # Transform database path to actual file system path
     actual_path = transform_db_path_to_actual_path(db_path)
     
-    print(f"  DB Path:     {db_path}")
-    print(f"  Actual Path: {actual_path}")
+    proc_name = current_process().name
+    print(f"[{proc_name}] GPU {gpu_id}: Processing {data_id}")
     
     # Check if source file exists
     if not os.path.exists(actual_path):
-        print(f"  ✗ Source file not found at actual path")
-        return False
+        print(f"[{proc_name}] ✗ Source file not found: {actual_path}")
+        return {'status': 'error', 'gpu': gpu_id}
     
     # Extract date components
     year = timestamp.strftime("%Y")
@@ -278,27 +259,30 @@ def process_file_record(models, record, processed_set, devices):
     
     # Skip if already processed
     if str(dst_file) in processed_set or dst_file.exists():
-        print(f"  ⊘ Already processed: {dst_file.name}")
-        return False
+        print(f"[{proc_name}] ⊘ Already processed: {dst_file.name}")
+        return {'status': 'skipped', 'gpu': gpu_id}
     
     try:
-        # Read metadata and check cloud coverage
+        # Load model on this GPU
+        model = ImprovedCNN()
+        model.load_state_dict(
+            torch.load('best_model_seasonal.pth', map_location='cpu', weights_only=True)
+        )
+        model.to(device)
+        model.eval()
+        
+        # Check cloud coverage
         with rasterio.open(actual_path) as src:
-            img_shape = (src.count, src.height, src.width)
-            print(f"  └─ Total Bands: {img_shape[0]}, Size: {img_shape[1]}x{img_shape[2]}")
-            print(f"      Using bands: {SELECTED_BANDS} (B2,B3,B4,B8,SCL)")
-            
-            # Check cloud coverage using SCL band (band 15)
             scl_band = src.read(15)
         
         if is_cloudy_tile(scl_band, 0.8):
             cloud_pct = (np.isin(scl_band, [8,9,10,11]).sum() / scl_band.size) * 100
-            print(f"  ✗ Cloudy tile ({cloud_pct:.1f}% clouds), skipping")
-            return False
+            print(f"[{proc_name}] ✗ Cloudy tile ({cloud_pct:.1f}% clouds)")
+            return {'status': 'cloudy', 'gpu': gpu_id}
         
-        # Process image in tiles using both GPUs
+        # Process image in tiles
         prob_output, bbox, crs = process_large_image_tiled(
-            models, actual_path, devices=devices,
+            model, actual_path, device=device,
             tile_size=TILE_SIZE, overlap=OVERLAP
         )
         
@@ -308,27 +292,29 @@ def process_file_record(models, record, processed_set, devices):
         # Save probability raster
         save_raster_tif(dst_file, prob_scaled, bbox, crs)
         
-        # Add to processed set
-        processed_set.add(str(dst_file))
-        
         # Log processed file
         with open('processed.log', 'a') as f:
             f.write(f"{dst_file}\n")
         
-        print(f"  ✓ Saved: {dst_file.name}")
-        return True
+        print(f"[{proc_name}] ✓ Saved: {dst_file.name}")
+        
+        # Clean up
+        del model
+        torch.cuda.empty_cache()
+        
+        return {'status': 'success', 'gpu': gpu_id, 'file': str(dst_file)}
         
     except Exception as e:
-        print(f"  ✗ ERROR: {e}")
+        print(f"[{proc_name}] ✗ ERROR: {e}")
         import traceback
         traceback.print_exc()
-        return False
+        return {'status': 'error', 'gpu': gpu_id, 'error': str(e)}
 
 # ---------------------------------------------------
 # MAIN PIPELINE
 # ---------------------------------------------------
 def run_pipeline():
-    """Main processing pipeline with multi-GPU support"""
+    """Main processing pipeline with multi-GPU parallel processing"""
     
     print("="*70)
     print("SENTINEL-2 BUILDING PROBABILITY PREDICTION PIPELINE")
@@ -336,7 +322,6 @@ def run_pipeline():
     print(f"\nBand Selection: {SELECTED_BANDS}")
     print(f"  B2 (Blue), B3 (Green), B4 (Red), B8 (NIR), B15 (SCL)")
     print(f"\nTiled Processing: {TILE_SIZE}x{TILE_SIZE} pixels with {OVERLAP}px overlap")
-    print(f"Multi-GPU: Using GPUs {USE_GPUS}")
     print("\nPath Mapping:")
     print("  /mnt/ridam/68_data/  → /mnt/68_data/PROCESSED_DATA_THEMES/")
     print("  /mnt/ridam/115_data/ → /home/sac/115_data/")
@@ -355,40 +340,15 @@ def run_pipeline():
         return
     
     num_gpus = torch.cuda.device_count()
-    print(f"Available GPUs: {num_gpus}")
+    print(f"Detected {num_gpus} GPUs:")
+    for i in range(num_gpus):
+        print(f"  GPU {i}: {torch.cuda.get_device_name(i)}")
+        print(f"          Memory: {torch.cuda.get_device_properties(i).total_memory / 1e9:.1f} GB")
     
-    if num_gpus < len(USE_GPUS):
-        print(f"✗ Requested {len(USE_GPUS)} GPUs but only {num_gpus} available")
-        USE_GPUS_ACTUAL = list(range(min(num_gpus, len(USE_GPUS))))
-    else:
-        USE_GPUS_ACTUAL = USE_GPUS
-    
-    # Load CNN model on each GPU
-    print("\nLoading CNN models on GPUs...")
-    models = []
-    devices = []
-    
-    for gpu_id in USE_GPUS_ACTUAL:
-        device = torch.device(f'cuda:{gpu_id}')
-        model = ImprovedCNN()
-        
-        if not os.path.exists('best_model_seasonal.pth'):
-            print("✗ Model file 'best_model_seasonal.pth' not found!")
-            return
-        
-        model.load_state_dict(
-            torch.load('best_model_seasonal.pth', map_location='cpu', weights_only=True)
-        )
-        model.to(device)
-        model.eval()
-        
-        models.append(model)
-        devices.append(device)
-        
-        print(f"  ✓ GPU {gpu_id}: {torch.cuda.get_device_name(gpu_id)}")
-        print(f"      Memory: {torch.cuda.get_device_properties(gpu_id).total_memory / 1e9:.1f} GB")
-    
-    print(f"\nOutput directory: {OUTPUT_BASE_PATH}")
+    # Calculate number of parallel workers (1 per GPU)
+    num_workers = num_gpus
+    print(f"\nUsing {num_workers} parallel workers (1 per GPU)")
+    print(f"Output directory: {OUTPUT_BASE_PATH}")
     print()
     
     # Fetch file records
@@ -401,35 +361,34 @@ def run_pipeline():
     
     print(f"✓ Found {len(records)} files to process\n")
     print("="*70)
+    print("Starting parallel processing...\n")
     
-    # Process each file
+    # Prepare arguments for workers
+    worker_args = [(record, processed_set, num_gpus) for record in records]
+    
+    # Process files in parallel using multiprocessing
     success_count = 0
     skip_count = 0
     error_count = 0
+    cloudy_count = 0
     
-    for i, record in enumerate(records, 1):
-        print(f"\n[{i}/{len(records)}] {record['data_id']}")
-        print(f"  Date: {record['timestamp'].strftime('%Y-%m-%d')}")
-        
-        result = process_file_record(
-            models=models,
-            record=record,
-            processed_set=processed_set,
-            devices=devices
-        )
-        
-        if result:
-            success_count += 1
-        elif str(Path(OUTPUT_BASE_PATH) / record['timestamp'].strftime('%Y/%m/%d') / 
-                 f"MSI_probability_{record['timestamp'].strftime('%Y%m%d')}_{record['data_id']}.tif") in processed_set:
-            skip_count += 1
-        else:
-            error_count += 1
-        
-        # Clear GPU cache periodically on all GPUs
-        if i % 10 == 0:
-            for gpu_id in USE_GPUS_ACTUAL:
-                torch.cuda.empty_cache()
+    with Pool(processes=num_workers) as pool:
+        for result in pool.imap_unordered(process_file_worker, worker_args):
+            if result['status'] == 'success':
+                success_count += 1
+            elif result['status'] == 'skipped':
+                skip_count += 1
+            elif result['status'] == 'cloudy':
+                cloudy_count += 1
+            else:
+                error_count += 1
+            
+            # Progress update every 10 files
+            total_processed = success_count + skip_count + error_count + cloudy_count
+            if total_processed % 10 == 0:
+                print(f"\n--- Progress: {total_processed}/{len(records)} files ---")
+                print(f"    ✓ Success: {success_count} | ⊘ Skipped: {skip_count}")
+                print(f"    ☁ Cloudy: {cloudy_count} | ✗ Error: {error_count}\n")
     
     # Summary
     print("\n" + "="*70)
@@ -438,13 +397,17 @@ def run_pipeline():
     print(f"Total files:      {len(records)}")
     print(f"✓ Processed:      {success_count}")
     print(f"⊘ Skipped:        {skip_count}")
-    print(f"✗ Failed/Empty:   {error_count}")
+    print(f"☁ Cloudy:         {cloudy_count}")
+    print(f"✗ Failed/Error:   {error_count}")
     print("="*70)
 
 # ---------------------------------------------------
 # ENTRY POINT
 # ---------------------------------------------------
 if __name__ == '__main__':
+    # Required for CUDA multiprocessing
+    torch.multiprocessing.set_start_method('spawn', force=True)
+    
     try:
         run_pipeline()
     except KeyboardInterrupt:
