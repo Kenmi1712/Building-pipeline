@@ -4,6 +4,7 @@ import sys
 import numpy as np
 import rasterio
 from rasterio.transform import from_bounds
+from rasterio.windows import Window
 from pathlib import Path
 import psycopg2
 from psycopg2.extras import RealDictCursor
@@ -12,9 +13,11 @@ import torch.nn as nn
 from config import *
 
 # ---------------------------------------------------
-# OUTPUT PATH CONFIGURATION
+# CONFIGURATION
 # ---------------------------------------------------
 OUTPUT_BASE_PATH = Path("/mnt/68_data/PROCESSED_DATA_THEMES/T6/T6S1/s2_ai_building_probability_T6S1P15")
+TILE_SIZE = 1024  # Process in 1024x1024 tiles to avoid OOM
+OVERLAP = 64      # Overlap between tiles to avoid edge artifacts
 
 # ---------------------------------------------------
 # CNN MODEL
@@ -58,17 +61,13 @@ def transform_db_path_to_actual_path(db_path):
         actual_path = db_path_str.replace('/mnt/ridam/115_data/', '/home/sac/115_data/')
         return actual_path
     else:
-        # Return original path if no match
         return db_path_str
 
 # ---------------------------------------------------
-# DATABASE FETCH - Get file paths from published_rasters
+# DATABASE FETCH
 # ---------------------------------------------------
 def fetch_file_records():
-    """
-    Fetch source file paths from database for T0S1P0 dataset
-    within specified spatial extent
-    """
+    """Fetch source file paths from database for T0S1P0 dataset"""
     query = """
     SELECT
         data_id,
@@ -91,11 +90,8 @@ def fetch_file_records():
     
     try:
         conn = psycopg2.connect(
-            host=DB_HOST, 
-            port=DB_PORT, 
-            dbname=DB_NAME, 
-            user=DB_USER, 
-            password=DB_PASSWORD
+            host=DB_HOST, port=DB_PORT, dbname=DB_NAME, 
+            user=DB_USER, password=DB_PASSWORD
         )
         
         records = []
@@ -132,7 +128,10 @@ def save_raster_tif(filename, array, bbox, projection='EPSG:4326'):
         dtype=array.dtype, 
         crs=projection, 
         transform=transform,
-        compress='lzw'
+        compress='lzw',
+        tiled=True,
+        blockxsize=256,
+        blockysize=256
     ) as dst:
         for i in range(array.shape[0]):
             dst.write(array[i], i+1)
@@ -159,22 +158,93 @@ def apply_cloud_mask(msi_array, cloud_band_values=[4,5,7], fill_value=-1):
     return msi_masked, mask
 
 def is_cloudy_tile(scl_band, threshold=0.80):
-    """
-    Check if tile exceeds cloud threshold
-    Cloud classes: 8=medium clouds, 9=high clouds, 10=thin cirrus, 11=snow/ice
-    """
+    """Check if tile exceeds cloud threshold"""
     cloud_classes = {8, 9, 10, 11}
     cloud_fraction = np.isin(scl_band, list(cloud_classes)).sum() / scl_band.size
     return cloud_fraction >= threshold
 
 # ---------------------------------------------------
-# PROCESS SINGLE FILE WITH CNN INFERENCE
+# TILED PROCESSING FOR LARGE IMAGES
+# ---------------------------------------------------
+def process_large_image_tiled(model, src_path, device='cuda', tile_size=1024, overlap=64):
+    """
+    Process large image in tiles to avoid CUDA OOM
+    Returns probability array for entire image
+    """
+    with rasterio.open(src_path) as src:
+        full_height = src.height
+        full_width = src.width
+        bbox = src.bounds
+        crs = src.crs
+        
+        # Initialize output array
+        prob_output = np.zeros((full_height, full_width), dtype=np.float32)
+        count_output = np.zeros((full_height, full_width), dtype=np.float32)
+        
+        # Calculate number of tiles
+        n_tiles_y = (full_height + tile_size - 1) // tile_size
+        n_tiles_x = (full_width + tile_size - 1) // tile_size
+        total_tiles = n_tiles_y * n_tiles_x
+        
+        print(f"  └─ Processing {n_tiles_y}x{n_tiles_x} = {total_tiles} tiles")
+        
+        tile_count = 0
+        
+        # Process each tile
+        for i in range(0, full_height, tile_size - overlap):
+            for j in range(0, full_width, tile_size - overlap):
+                tile_count += 1
+                
+                # Calculate window bounds
+                row_off = i
+                col_off = j
+                win_height = min(tile_size, full_height - i)
+                win_width = min(tile_size, full_width - j)
+                
+                # Create window
+                window = Window(col_off, row_off, win_width, win_height)
+                
+                # Read tile data
+                tile_data = src.read(window=window)
+                
+                # Check if tile is empty
+                if not np.any(tile_data != 0):
+                    continue
+                
+                # Standardize channels
+                tile_data = standardize_channels(tile_data, 4)
+                
+                # Normalize
+                tile_normalized = tile_data.astype(np.float32) / 10000.0
+                
+                # Run inference
+                model.eval()
+                with torch.no_grad():
+                    tensor = torch.from_numpy(tile_normalized).unsqueeze(0).to(device)
+                    prob_tile = model(tensor).cpu().numpy()[0, 0]
+                    
+                    # Free GPU memory
+                    del tensor
+                    torch.cuda.empty_cache()
+                
+                # Add to output (weighted averaging for overlapping regions)
+                prob_output[row_off:row_off+win_height, col_off:col_off+win_width] += prob_tile
+                count_output[row_off:row_off+win_height, col_off:col_off+win_width] += 1
+                
+                if tile_count % 10 == 0:
+                    print(f"      Tile {tile_count}/{total_tiles} processed")
+        
+        # Average overlapping regions
+        count_output[count_output == 0] = 1  # Avoid division by zero
+        prob_output = prob_output / count_output
+        
+        return prob_output, bbox, crs
+
+# ---------------------------------------------------
+# PROCESS SINGLE FILE
 # ---------------------------------------------------
 def process_file_record(model, record, processed_set, device='cuda', threshold=0.4):
-    """
-    Process a single Sentinel-2 file from database record
-    Apply CNN model for building probability prediction
-    """
+    """Process a single Sentinel-2 file from database record"""
     db_path = record['source_file_path']
     timestamp = record['timestamp']
     data_id = record['data_id']
@@ -190,17 +260,17 @@ def process_file_record(model, record, processed_set, device='cuda', threshold=0
         print(f"  ✗ Source file not found at actual path")
         return False
     
-    # Extract date components for folder structure
+    # Extract date components
     year = timestamp.strftime("%Y")
     month = timestamp.strftime("%m")
     day = timestamp.strftime("%d")
     date_str = f"{year}{month}{day}"
     
-    # Create output directory structure: /mnt/68_data/.../YYYY/MM/DD/
+    # Create output directory
     target_dir = OUTPUT_BASE_PATH / year / month / day
     target_dir.mkdir(parents=True, exist_ok=True)
     
-    # Generate output filename with data_id for uniqueness
+    # Output filename
     dst_file = target_dir / f"MSI_probability_{date_str}_{data_id}.tif"
     
     # Skip if already processed
@@ -209,49 +279,27 @@ def process_file_record(model, record, processed_set, device='cuda', threshold=0
         return False
     
     try:
-        # Read source raster using rasterio
+        # Read metadata first
         with rasterio.open(actual_path) as src:
-            arr = src.read()  # Read all bands
-            bbox = src.bounds
-            crs = src.crs
+            img_shape = (src.count, src.height, src.width)
+            print(f"  └─ Bands: {img_shape[0]}, Size: {img_shape[1]}x{img_shape[2]}")
             
-            print(f"  └─ Bands: {arr.shape[0]}, Size: {arr.shape[1]}x{arr.shape[2]}")
-        
-        # Check for empty tile
-        if not np.any(arr != 0):
-            print(f"  ✗ Empty tile (all zeros), skipping")
-            return False
-        
-        # Check cloud coverage using SCL band (last band or band index 4)
-        scl_band = arr[4] if arr.shape[0] > 4 else arr[-1]
+            # Check cloud coverage using SCL band
+            scl_band = src.read(5) if src.count > 4 else src.read(src.count)
         
         if is_cloudy_tile(scl_band, 0.8):
             cloud_pct = (np.isin(scl_band, [8,9,10,11]).sum() / scl_band.size) * 100
             print(f"  ✗ Cloudy tile ({cloud_pct:.1f}% clouds), skipping")
             return False
         
-        # Standardize to 4 channels (typically B,G,R,NIR)
-        arr = standardize_channels(arr, 4)
+        # Process image in tiles
+        prob_output, bbox, crs = process_large_image_tiled(
+            model, actual_path, device=device, 
+            tile_size=TILE_SIZE, overlap=OVERLAP
+        )
         
-        # Apply cloud mask if needed
-        if arr.shape[0] > 4:
-            arr, _ = apply_cloud_mask(arr, [4,5,7], -1)
-            arr[arr == -1] = 0
-        
-        # Normalize to [0, 1] range (Sentinel-2 values are typically 0-10000)
-        arr_normalized = arr.astype(np.float32) / 10000.0
-        
-        # Run CNN inference
-        model.eval()
-        with torch.no_grad():
-            # Convert to tensor and add batch dimension
-            tensor = torch.from_numpy(arr_normalized).unsqueeze(0).to(device)
-            
-            # Get probability prediction
-            prob = model(tensor).cpu().numpy()[0, 0]
-            
-            # Scale probability to 0-100 and convert to uint16
-            prob_scaled = (prob * 100).astype(np.uint16)
+        # Scale probability to 0-100
+        prob_scaled = (prob_output * 100).astype(np.uint16)
         
         # Save probability raster
         save_raster_tif(dst_file, prob_scaled, bbox, crs)
@@ -276,23 +324,18 @@ def process_file_record(model, record, processed_set, device='cuda', threshold=0
 # MAIN PIPELINE
 # ---------------------------------------------------
 def run_pipeline():
-    """
-    Main processing pipeline:
-    1. Load CNN model
-    2. Fetch file records from database
-    3. Transform DB paths to actual file system paths
-    4. Process each file with building probability inference
-    """
+    """Main processing pipeline"""
     
     print("="*70)
     print("SENTINEL-2 BUILDING PROBABILITY PREDICTION PIPELINE")
     print("="*70)
+    print(f"\nTiled Processing: {TILE_SIZE}x{TILE_SIZE} pixels with {OVERLAP}px overlap")
     print("\nPath Mapping:")
     print("  /mnt/ridam/68_data/  → /mnt/68_data/PROCESSED_DATA_THEMES/")
     print("  /mnt/ridam/115_data/ → /home/sac/115_data/")
     print()
     
-    # Load processed files log to avoid reprocessing
+    # Load processed files log
     processed_set = set()
     if os.path.exists('processed.log'):
         with open('processed.log', 'r') as f:
@@ -324,7 +367,7 @@ def run_pipeline():
     print(f"\nOutput directory: {OUTPUT_BASE_PATH}")
     print()
     
-    # Fetch file records from database
+    # Fetch file records
     print("Fetching file records from database...")
     records = fetch_file_records()
     
@@ -359,6 +402,10 @@ def run_pipeline():
             skip_count += 1
         else:
             error_count += 1
+        
+        # Clear GPU cache periodically
+        if device == 'cuda' and i % 10 == 0:
+            torch.cuda.empty_cache()
     
     # Summary
     print("\n" + "="*70)
