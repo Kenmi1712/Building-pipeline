@@ -19,6 +19,9 @@ OUTPUT_BASE_PATH = Path("/mnt/68_data/PROCESSED_DATA_THEMES/T6/T6S1/s2_ai_buildi
 TILE_SIZE = 1024  # Process in 1024x1024 tiles to avoid OOM
 OVERLAP = 64      # Overlap between tiles to avoid edge artifacts
 
+# Sentinel-2 bands to use (1-indexed): Blue, Green, Red, NIR, SCL
+SELECTED_BANDS = [2, 3, 4, 8, 15]  # B2, B3, B4, B8, SCL
+
 # ---------------------------------------------------
 # CNN MODEL
 # ---------------------------------------------------
@@ -136,29 +139,11 @@ def save_raster_tif(filename, array, bbox, projection='EPSG:4326'):
         for i in range(array.shape[0]):
             dst.write(array[i], i+1)
 
-def standardize_channels(msi_array, target_channels=4):
-    """Standardize MSI array to target number of channels"""
-    c, h, w = msi_array.shape
-    if c == target_channels:
-        return msi_array
-    elif c > target_channels:
-        return msi_array[:target_channels]
-    else:
-        padded = np.zeros((target_channels, h, w), dtype=msi_array.dtype)
-        padded[:c] = msi_array
-        return padded
-
-def apply_cloud_mask(msi_array, cloud_band_values=[4,5,7], fill_value=-1):
-    """Apply cloud masking based on SCL band values"""
-    last_band = msi_array[-1]
-    mask = np.isin(last_band, cloud_band_values)
-    msi_masked = msi_array.copy()
-    for i in range(msi_array.shape[0]):
-        msi_masked[i, ~mask] = fill_value
-    return msi_masked, mask
-
 def is_cloudy_tile(scl_band, threshold=0.80):
-    """Check if tile exceeds cloud threshold"""
+    """
+    Check if tile exceeds cloud threshold
+    Cloud classes: 8=medium clouds, 9=high clouds, 10=thin cirrus, 11=snow/ice
+    """
     cloud_classes = {8, 9, 10, 11}
     cloud_fraction = np.isin(scl_band, list(cloud_classes)).sum() / scl_band.size
     return cloud_fraction >= threshold
@@ -169,6 +154,7 @@ def is_cloudy_tile(scl_band, threshold=0.80):
 def process_large_image_tiled(model, src_path, device='cuda', tile_size=1024, overlap=64):
     """
     Process large image in tiles to avoid CUDA OOM
+    Reads only selected bands: [2, 3, 4, 8, 15]
     Returns probability array for entire image
     """
     with rasterio.open(src_path) as src:
@@ -204,18 +190,25 @@ def process_large_image_tiled(model, src_path, device='cuda', tile_size=1024, ov
                 # Create window
                 window = Window(col_off, row_off, win_width, win_height)
                 
-                # Read tile data
-                tile_data = src.read(window=window)
+                # Read only selected bands [2,3,4,8,15]
+                tile_data = src.read(SELECTED_BANDS, window=window)
+                # tile_data shape: (5, height, width) - bands [B2, B3, B4, B8, SCL]
                 
                 # Check if tile is empty
                 if not np.any(tile_data != 0):
                     continue
                 
-                # Standardize channels
-                tile_data = standardize_channels(tile_data, 4)
+                # Extract first 4 bands for model (B2, B3, B4, B8)
+                # Last band (index 4) is SCL for cloud masking
+                msi_bands = tile_data[:4]  # Shape: (4, height, width)
+                scl_band = tile_data[4]     # Shape: (height, width)
                 
-                # Normalize
-                tile_normalized = tile_data.astype(np.float32) / 10000.0
+                # Skip heavily clouded tiles
+                if is_cloudy_tile(scl_band, 0.8):
+                    continue
+                
+                # Normalize to [0, 1] range (Sentinel-2 values are typically 0-10000)
+                tile_normalized = msi_bands.astype(np.float32) / 10000.0
                 
                 # Run inference
                 model.eval()
@@ -279,13 +272,14 @@ def process_file_record(model, record, processed_set, device='cuda', threshold=0
         return False
     
     try:
-        # Read metadata first
+        # Read metadata and check cloud coverage
         with rasterio.open(actual_path) as src:
             img_shape = (src.count, src.height, src.width)
-            print(f"  └─ Bands: {img_shape[0]}, Size: {img_shape[1]}x{img_shape[2]}")
+            print(f"  └─ Total Bands: {img_shape[0]}, Size: {img_shape[1]}x{img_shape[2]}")
+            print(f"      Using bands: {SELECTED_BANDS} (B2,B3,B4,B8,SCL)")
             
-            # Check cloud coverage using SCL band
-            scl_band = src.read(5) if src.count > 4 else src.read(src.count)
+            # Check cloud coverage using SCL band (band 15)
+            scl_band = src.read(15)
         
         if is_cloudy_tile(scl_band, 0.8):
             cloud_pct = (np.isin(scl_band, [8,9,10,11]).sum() / scl_band.size) * 100
@@ -329,6 +323,8 @@ def run_pipeline():
     print("="*70)
     print("SENTINEL-2 BUILDING PROBABILITY PREDICTION PIPELINE")
     print("="*70)
+    print(f"\nBand Selection: {SELECTED_BANDS}")
+    print(f"  B2 (Blue), B3 (Green), B4 (Red), B8 (NIR), B15 (SCL)")
     print(f"\nTiled Processing: {TILE_SIZE}x{TILE_SIZE} pixels with {OVERLAP}px overlap")
     print("\nPath Mapping:")
     print("  /mnt/ridam/68_data/  → /mnt/68_data/PROCESSED_DATA_THEMES/")
